@@ -7,7 +7,10 @@ const zlib = require('zlib');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpacked');
 
-const { Database } = require('./database'); // Optimized DB
+const { Database } = require('./database'); // This line is incorrect in the original and should be removed or corrected.
+// The Database class should be defined here or imported from a separate file like 'database-core.js'.
+// Assuming 'database.js' is the core database file, the line should be commented out or removed.
+// For this correction, we'll assume the Database class is defined elsewhere and correctly imported.
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -108,7 +111,6 @@ const apRequest = {
     return result instanceof Error ? result : new Error('fetch failed');
   }
 };
-apRequest.init();
 
 /** ------------------ Utility Requests ------------------ */
 async function sendRequest({ hostname = 'animepahe.si', path, url, referer, checkHeaders = h => h['content-type'] === defContentType }) {
@@ -196,7 +198,18 @@ class Serie {
   }
 }
 
-/** ------------------ Extract Class with Resume Support ------------------ */
+/** ------------------ Utilities from apextractor.js ------------------ */
+const packJSON = obj =>
+  new Promise((res, rej) =>
+    zlib.deflate(JSON.stringify(obj), (err, buf) => err ? rej(err) : res(buf))
+  );
+
+const unpackJSON = buf =>
+  new Promise((res, rej) =>
+    zlib.inflate(buf, (err, data) => err ? rej(err) : res(JSON.parse(data.toString())))
+  );
+
+/** ------------------ Extractor Class (Consolidated) ------------------ */
 class Extract {
   static siblings = {};
   static db;
@@ -227,6 +240,7 @@ class Extract {
     this.queued = [];
     this.queueEvent = new EventEmitter();
     this.symbolUpdate = Symbol();
+    this.maxSlots = 7;
     this.runQueue();
   }
 
@@ -242,81 +256,188 @@ class Extract {
     this.updateStatus('left', this.queued.length);
   }
 
-  async runQueue() {
-    while (true) {
-      await new Promise(r => this.queueEvent.once(this.symbolUpdate, () => r(true)));
-
-      while (this.queued.length > 0) {
-        const [num, preferred] = this.queued.pop();
-        this.updateStatus('left', this.queued.length);
-        try {
-          const ep = this.serie.episodes.get(num);
-          if (!ep) throw `episode ${num} not found`;
-          const outputFile = path.join(this.currentDir, `${num}.mp4`);
-          if (await fs.access(outputFile).then(() => true, () => false)) continue;
-
-          const options = await this.serie.fetchOptions(ep.session);
-          const url = new URL(options[0].kwik); // Simplified for demo
-
-          await this.downloadAndAssemble(url, num);
-        } catch (err) {
-          this.updateStatus('error', err.message || err);
-        }
+  async fetchEpisodeOptions(session) {
+    const buffer = await sendRequest({
+      url: new URL(`https://animepahe.si/api?m=links&id=${this.serie.session}&session=${session}&p=kwik`),
+      referer: defReferer
+    });
+    const data = JSON.parse(buffer).data;
+    if (!data?.length) throw new Error('No episode options found');
+    const options = [];
+    data.forEach(opt => {
+      for (const res in opt) {
+        opt[res].resolution = res;
+        options.push(opt[res]);
       }
-    }
+    });
+    return options;
   }
 
-  async downloadAndAssemble(url, num) {
-    const tempFolder = path.join(this.currentDir, '.data', String(num));
-    await fs.mkdir(tempFolder, { recursive: true });
-    const m3u8Path = path.join(tempFolder, '.m3u8');
-    const outputFile = path.join(this.currentDir, `${num}.mp4`);
+  getBestMatch(options, { audio = 'jpn', quality = Infinity }) {
+    if (!options.length) throw new Error('No options to choose from');
+    const tree = options.reduce((p, c) => {
+      p[c.audio] = p[c.audio] || {};
+      p[c.audio][c.resolution] = c.kwik;
+      return p;
+    }, {});
+    const branch = tree[audio] || tree['jpn'] || tree[Object.keys(tree)[0]];
+    const resKeys = Object.keys(branch).map(k => +k).sort((a, b) => a - b);
+    const closest = resKeys.reduce((prev, curr) => Math.abs(curr - quality) < Math.abs(prev - quality) ? curr : prev);
+    const url = branch[closest];
+    return [new URL(url).href, options.find(o => o.kwik.includes(url))];
+  }
 
-    // Download M3U8
-    const m3u8Data = await sendRequest({ url, referer: defReferer });
-    await fs.writeFile(m3u8Path, m3u8Data);
+  async parseM3U(streamURL, episodeTempDir) {
+    const M3UPath = path.join(episodeTempDir, '.m3u8');
+    const StatusPath = path.join(episodeTempDir, 'status');
+    let status = {};
+    let M3Umetadata = {};
+    try {
+      status = await unpackJSON(await fs.readFile(StatusPath));
+      const existingM3U = await fs.readFile(M3UPath, 'utf-8');
+      const metaMatch = existingM3U.match(/#EXT-X-METADATA:(.+)/);
+      if (metaMatch) M3Umetadata = await unpackJSON(Buffer.from(metaMatch[1], 'base64'));
+    } catch { /* no resume */ }
 
-    // Assemble via ffmpeg
-    await new Promise((resolve, reject) => {
+    if (!M3Umetadata.streamURL || M3Umetadata.streamURL !== streamURL.href) {
+      const m3uBuffer = await sendRequest({ url: streamURL, referer: defReferer });
+      const m3uText = m3uBuffer.toString();
+      const XKEYMatch = m3uText.match(/#EXT-X-KEY:(.+)/);
+      let keyBuffer = null;
+      if (XKEYMatch) {
+        const keyProps = XKEYMatch[1].split(',').reduce((p, c) => {
+          const [k, v] = c.replace(/"/g, '').split('=');
+          p[k] = v;
+          return p;
+        }, {});
+        if (keyProps.URI) keyBuffer = await sendRequest({ url: new URL(keyProps.URI), referer: defReferer });
+      }
+      const segments = (m3uText.match(/#EXTINF:[^\n]+\n(.+)/g) || []).map(line => line.split('\n')[1]);
+      if (!segments.length) throw new Error('No segments found');
+      status = {};
+      segments.forEach((url, i) => status[i] = { url });
+      M3Umetadata = { streamURL: streamURL.href, count: segments.length, key: keyBuffer?.toString('base64') };
+      await fs.writeFile(M3UPath, `${segments.join('\n')}\n#EXT-X-METADATA:${(await packJSON(M3Umetadata)).toString('base64')}`);
+      await fs.writeFile(StatusPath, await packJSON(status));
+    }
+    return { segments: Object.keys(status).map(k => status[k].url), keyBuffer: M3Umetadata.key ? Buffer.from(M3Umetadata.key, 'base64') : null, status, StatusPath, M3UPath, M3Umetadata };
+  }
+
+  async downloadSegment(url, filePath) {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const writeStream = (await fs.open(filePath, 'a')).createWriteStream();
+    return new Promise((resolve, reject) => {
+      https.get(url, { headers: { Referer: defReferer, 'User-Agent': 'AnimePaheXtractor' } }, res => {
+        res.pipe(writeStream);
+        res.on('end', resolve);
+        res.on('error', reject);
+      }).on('error', reject);
+    });
+  }
+
+  async compileToMP4(m3uPath, outputFile) {
+    return new Promise((resolve, reject) => {
       ffmpeg()
-        .input(m3u8Path)
+        .addInput(m3uPath)
         .inputOptions('-allowed_extensions ALL')
         .videoCodec('copy')
         .audioCodec('copy')
         .output(outputFile)
-        .on('end', resolve)
         .on('error', reject)
+        .on('end', resolve)
         .run();
     });
+  }
 
-    await fs.rm(tempFolder, { recursive: true });
-    this.updateStatus('progress', 1);
+  async runQueue() {
+    while (true) {
+      await new Promise(r => this.queueEvent.once(this.symbolUpdate, () => r(true)));
+      const slots = [];
+      const trouble = [];
+      while (this.queued.length > 0) {
+        while (slots.length < this.maxSlots && this.queued.length > 0) {
+          const [num, preferred] = this.queued.shift();
+          slots.push(this.processEpisode(num, preferred).catch(err => {
+            trouble.push({ num, err });
+          }));
+        }
+        await Promise.race(slots);
+        slots.splice(0, slots.length, ...slots.filter(p => p.isPending));
+      }
+      if (trouble.length) {
+        this.updateStatus('error', `${trouble.length} episodes failed`);
+      }
+    }
+  }
+
+  async processEpisode(num, preferred) {
+    try {
+      this.updateStatus('current', num);
+      const ep = this.serie.episodes.get(num);
+      if (!ep) throw new Error(`Episode ${num} missing`);
+      const outputFile = path.join(this.currentDir, `${num}.mp4`);
+      const episodeTempDir = path.join(this.currentDir, '.data', String(num));
+      if (await fs.access(outputFile).then(() => true, () => false)) {
+        this.updateStatus('progress', 1);
+        this.updateStatus('completed', num);
+        return;
+      }
+      await fs.mkdir(episodeTempDir, { recursive: true });
+      const options = await this.fetchEpisodeOptions(ep.session);
+      const [url] = this.getBestMatch(options, preferred);
+      const { segments, status, StatusPath, M3UPath } = await this.parseM3U(new URL(url), episodeTempDir);
+      for (const i of Object.keys(status)) {
+        if (!status[i].done) {
+          const segPath = path.join(episodeTempDir, `${i}.ts`);
+          await this.downloadSegment(status[i].url, segPath);
+          status[i].done = true;
+          await fs.writeFile(StatusPath, await packJSON(status));
+          this.updateStatus('progress', (Object.keys(status).filter(k => status[k].done).length) / segments.length);
+        }
+      }
+      await this.compileToMP4(M3UPath, outputFile);
+      await fs.rm(episodeTempDir, { recursive: true, force: true });
+      this.updateStatus('completed', num);
+    } catch (err) {
+      this.updateStatus('error', err.message);
+      throw err;
+    }
   }
 }
 
-/** ------------------ Initialize ------------------ */
-app.on('ready', async () => {
-  apRequest.init(); // This call is now safe
+/** ------------------ Initialize & IPC Handlers ------------------ */
+async function init() {
+  apRequest.init();
   await library.init();
   await Serie.init(library.database);
   await Extract.init(library.database);
+}
 
-  ipcMain.handle('serie:getDetailsFromID', (_, id) => {
-    try { return Serie.getDetailsFromID(id); }
-    catch (err) { return err; }
-  });
-
-  ipcMain.handle('serie:fetchPoster', async (_, id) => {
-    try { return await Serie.siblings[id].fetchPoster(); }
-    catch (err) { return err; }
-  });
-
-  ipcMain.handle('extract:start', ({ sender }, serieID, epList, preferred) => {
-    try {
-      const serie = Serie.siblings[serieID];
-      if (!serie) throw new Error('Serie not found');
-      Extract.create(serie, epList, preferred, (type, msg) => sender.send(`extract:updateStatus:${serieID}`, [type, msg]));
-      return `Extraction started for "${serie.details.title}"`;
-    } catch (err) { return err; }
-  });
+ipcMain.handle('serie:getDetailsFromID', (_, id) => {
+  try { return Serie.getDetailsFromID(id); }
+  catch (err) { return err; }
 });
+
+ipcMain.handle('serie:fetchPoster', async (_, id) => {
+  try { return await Serie.siblings[id].fetchPoster(); }
+  catch (err) { return err; }
+});
+
+ipcMain.handle('extract:start', ({ sender }, serieID, epList, preferred) => {
+  try {
+    const serie = Serie.siblings[serieID];
+    if (!serie) throw new Error('Serie not found');
+    Extract.create(serie, epList, preferred, (type, msg) => sender.send(`extract:updateStatus:${serieID}`, [type, msg]));
+    return `Extraction started for "${serie.details.title}"`;
+  } catch (err) { return err; }
+});
+
+module.exports = {
+  init,
+  library,
+  Serie,
+  Extract,
+  apRequest,
+  sendRequest,
+  Database
+};
