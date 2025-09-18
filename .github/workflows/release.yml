@@ -16,11 +16,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-node@v4
         with:
-          node-version: 17.x
+          node-version: 18.x
           cache: "yarn"
-          cache-dependency-path: ./app/yarn.lock
+          cache-dependency-path: yarn.lock
       - run: yarn install --frozen-lockfile
       - run: yarn run dist
       - uses: "marvinpinto/action-automatic-releases@latest"
