@@ -9,7 +9,7 @@ const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpack
 
 // Define the Database class or import it from a separate, single-purpose file if available.
 // For this example, we assume it's part of the core database module.
-// const { Database } = require('./database-core');
+const { Database } = require('./database-core');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
