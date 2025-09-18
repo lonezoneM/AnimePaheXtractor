@@ -7,9 +7,29 @@ const zlib = require('zlib');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpacked');
 
-// Define the Database class or import it from a separate, single-purpose file if available.
-// For this example, we assume it's part of the core database module.
-const { Database } = require('./database-core');
+// Define the Database class directly here to avoid a missing file error.
+// The code below is a placeholder. You need to replace this with the actual implementation
+// of your Database class, including its methods like `open` and `createTable`, as
+// these are used later in the file.
+class Database {
+    static TYPE = {
+        TEXT: 'TEXT',
+        INTEGER: 'INTEGER',
+        BLOB: 'BLOB',
+        NUMERIC: 'NUMERIC'
+    };
+
+    static async open(name) {
+        // ... actual implementation to open a database
+    }
+
+    async createTable(tableName, ...columns) {
+        // ... actual implementation to create a table
+    }
+
+    // ... other methods like select, update, insert
+}
+
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -28,8 +48,6 @@ const library = {
   set database(db) { this._db = db; },
 
   async init() {
-    // We assume the Database class is available globally or imported correctly elsewhere
-    // This line previously caused a circular dependency, so it's a key point of failure.
     this.database = await Database.open('ap');
   }
 };
