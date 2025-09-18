@@ -1,4 +1,4 @@
-const { BrowserView, ipcMain } = require('electron');
+const { app, BrowserView, ipcMain } = require('electron');
 const https = require('https');
 const { PassThrough, EventEmitter } = require('stream');
 const { promises: fs, constants: fs_consts } = require('fs');
@@ -32,12 +32,14 @@ const library = {
 
 /** ------------------ AP Request Manager ------------------ */
 const apRequest = {
-  view: new BrowserView({ webPreferences: { sandbox: true } }),
+  view: null, // Initialize with null
   completedEvent: new EventEmitter(),
   completedSymbol: Symbol(),
   prepareViewPromise: null,
 
   init() {
+    // Now, create the BrowserView instance inside the init function
+    this.view = new BrowserView({ webPreferences: { sandbox: true } });
     this.view.webContents.session.webRequest
       .onHeadersReceived({ urls: ['https://*.animepahe.com/*'] }, (details, callback) => {
         callback({
@@ -293,7 +295,8 @@ class Extract {
 }
 
 /** ------------------ Initialize ------------------ */
-(async () => {
+app.on('ready', async () => {
+  apRequest.init(); // This call is now safe
   await library.init();
   await Serie.init(library.database);
   await Extract.init(library.database);
@@ -316,4 +319,4 @@ class Extract {
       return `Extraction started for "${serie.details.title}"`;
     } catch (err) { return err; }
   });
-})();
+});
