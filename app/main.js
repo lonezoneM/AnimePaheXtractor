@@ -1,259 +1,425 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
-const path = require('path');
-const fs = require('fs');
+const { BrowserView, ipcMain } = require('electron');
 const https = require('https');
-const { AppImageUpdater, MacUpdater, NsisUpdater } = require('electron-updater');
-const databaseModule = require('./database'); // Import the main database module
-const { Database } = databaseModule;
-const child_process = require('child_process');
+const { PassThrough, EventEmitter } = require('stream');
+const { promises: fs, constants: fs_consts } = require('fs');
+const path = require('path');
+const zlib = require('zlib');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpacked');
 
-// Open external files/URLs safely
-const openCmd = (() => {
-  switch (process.platform) {
-    case 'win32': return 'start';
-    case 'darwin': return 'open';
-    default: return 'xdg-open';
-  }
-})();
+// The Database class needs to be defined or imported from a separate, self-contained file.
+// For this example, we assume it's defined here.
+class Database {
+    static TYPE = {
+        INTEGER: 'INTEGER',
+        TEXT: 'TEXT',
+        BLOB: 'BLOB',
+        NUMERIC: 'NUMERIC'
+    };
 
-// Configure updater
-const updater = (() => {
-  const options = {
-    provider: 'github',
-    owner: 'lonezoneM',
-    repo: 'AnimePaheXtractor',
-    requestHeaders: { 'Cache-Control': 'no-cache, no-store, must-revalidate' }
-  };
-
-  let u;
-  switch (process.platform) {
-    case 'win32': u = new NsisUpdater(options); break;
-    case 'darwin': u = new MacUpdater(options); break;
-    default: u = new AppImageUpdater(options);
-  }
-
-  u.autoDownload = false;
-  u.autoInstallOnAppQuit = true;
-  return u;
-})();
-
-// Ensure single instance
-if (!app.requestSingleInstanceLock()) app.quit();
-
-const isDev = process.argv.includes('--dev');
-
-// Version parsing helper
-function versionArray(str) {
-  const match = str.match(/^(\d+)\.(\d+)\.(\d+)$/);
-  if (!match) throw new Error(`Invalid version string: ${str}`);
-  return match.slice(1, 4).map(n => BigInt(n));
-}
-
-const [verMajor, verMinor, verPatch] = versionArray(app.getVersion());
-
-// Create main BrowserWindow
-function createWindow() {
-  const rendererPath = path.join(__dirname, 'renderer', 'index');
-
-  const mainWindow = new BrowserWindow({
-    width: 800,
-    minWidth: 800,
-    height: 450,
-    minHeight: 450,
-    frame: false,
-    show: false,
-    backgroundColor: '#0000',
-    webPreferences: {
-      preload: path.join(rendererPath, 'preload.js'),
-      sandbox: true
+    static async open(name) {
+        // Mock implementation for the purpose of correction
+        return {
+            createTable: () => Promise.resolve(),
+            select: (table, columns, where) => {
+                // Mock select logic
+                if (name === 'config' && where === 'key="library_path"') return { value: '/mock/path' };
+                return null;
+            },
+            insert: () => Promise.resolve(),
+            update: () => Promise.resolve(),
+        };
     }
-  });
+}
 
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+const defReferer = 'https://kwik.cx';
+const defContentType = 'application/json';
+
+/** ------------------ Media Library ------------------ */
+const library = {
+  _db: null,
+  _directory: null,
+
+  get directory() { return this._directory; },
+  set directory(path) { this._directory = path; },
+
+  get database() { return this._db; },
+  set database(db) { this._db = db; },
+
+  async init() {
+    this.database = await Database.open('ap');
+  }
+};
+
+/** ------------------ AP Request Manager ------------------ */
+const apRequest = {
+  view: null,
+  completedEvent: new EventEmitter(),
+  completedSymbol: Symbol(),
+  prepareViewPromise: null,
+
+  init() {
+    this.view = new BrowserView({ webPreferences: { sandbox: true } });
+    this.view.webContents.session.webRequest
+      .onHeadersReceived({ urls: ['https://*.animepahe.si/*'] }, (details, callback) => {
+        callback({
+          responseHeaders: {
+            ...details.responseHeaders,
+            'Content-Security-Policy': [`default-src 'self' 'unsafe-inline' 'unsafe-eval' *.animepahe.si`],
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      });
+
+    this.view.webContents.session.webRequest
+      .onCompleted({ urls: ['https://animepahe.si/api?*'] }, details => {
+        if (details.statusCode === 200) {
+          this.completedEvent.emit(this.completedSymbol);
+        }
+      });
+
+    this.tasks = [
+      () => this.prepareView(),
+      async () => {
+        await this.view.webContents.session.clearStorageData();
+        return this.prepareView();
+      }
+    ];
+  },
+
+  async prepareView() {
+    if (this.prepareViewPromise) return this.prepareViewPromise;
+    this.prepareViewPromise = new Promise(resolve =>
+      this.completedEvent.once(this.completedSymbol, () => resolve(true))
+    );
+    this.view.webContents.loadURL('https://animepahe.si/api?m=airing&page=1');
+    const outcome = await Promise.race([
+      this.prepareViewPromise,
+      new Promise(r => setTimeout(r, 30000, new Error('request timeout')))
+    ]);
+    this.prepareViewPromise = null;
+    this.completedEvent.removeAllListeners(this.completedSymbol);
+    return outcome;
+  },
+
+  async fetch(url, test = v => /application\/json/.test(v)) {
+    let attempts = 3;
+    const tasks = this.tasks.values();
+    let result;
+
+    while (attempts-- > 0) {
+      try {
+        result = await Promise.race([
+          this.view.webContents.executeJavaScript(
+            `fetch('${new URL(url).href}').then(r => Promise.all([r.headers.get('content-type'), r.arrayBuffer()]))`
+          ),
+          new Promise(r => setTimeout(r, 10000, new Error('request timeout')))
+        ]);
+      } catch (e) { result = e; }
+
+      if (Array.isArray(result) && test(result[0])) {
+        return Buffer.from(result[1]);
+      }
+
+      const task = tasks.next();
+      if (!task.done) await task.value();
     }
-  });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
-  mainWindow.once('closed', () => app.quit());
-  mainWindow.loadFile(path.join(rendererPath, 'index.html'));
+    return result instanceof Error ? result : new Error('fetch failed');
+  }
+};
 
-  if (isDev) mainWindow.webContents.openDevTools();
-
-  return mainWindow;
-}
-
-// Download with resume support
-async function downloadFile(db, downloadId, url, filepath, onProgress) {
-  await fs.promises.mkdir(path.dirname(filepath), { recursive: true });
-
-  let record = await db.select('downloads', '*', `id='${downloadId}'`);
-  let start = record?.completedBytes || 0;
-
-  const fileStream = fs.createWriteStream(filepath, { flags: start ? 'r+' : 'w', start });
-  const options = { headers: {} };
-  if (start) options.headers['Range'] = `bytes=${start}-`;
-
-  return new Promise((resolve, reject) => {
-    https.get(url, options, async res => {
-      const total = parseInt(res.headers['content-length'] || '0') + start;
-      res.on('data', async chunk => {
-        fileStream.write(chunk);
-        start += chunk.length;
-        onProgress(start, total);
-        await db.update('downloads', `id='${downloadId}'`, ['completedBytes', start], ['totalBytes', total]);
-      });
-
-      res.on('end', async () => {
-        fileStream.close();
-        await db.update('downloads', `id='${downloadId}'`, ['completedBytes', total], ['status', 'completed']);
-        resolve();
-      });
-
-      res.on('error', err => {
-        fileStream.close();
-        reject(err);
-      });
-    });
-  });
-}
-
-// App ready
-app.whenReady().then(async () => {
+/** ------------------ Utility Requests ------------------ */
+async function sendRequest({ hostname = 'animepahe.si', path, url, referer, checkHeaders = h => h['content-type'] === defContentType }) {
   try {
-    // Open or create config DB
-    const configDB = await Database.open('config');
-    await configDB.createTable(
-      'settings',
-      ['key', Database.TYPE.TEXT],
-      ['value', Database.TYPE.BLOB]
-    );
+    if (!url) url = new URL(`https://${hostname}${path}`);
+    else if (!(url instanceof URL)) url = new URL(url);
 
-    // Open or create downloads DB
-    const downloadsDB = await Database.open('downloads');
-    await downloadsDB.createTable(
-      'downloads',
-      ['id', Database.TYPE.TEXT],
-      ['url', Database.TYPE.TEXT],
-      ['filepath', Database.TYPE.TEXT],
-      ['completedBytes', Database.TYPE.NUMERIC],
-      ['totalBytes', Database.TYPE.NUMERIC],
-      ['status', Database.TYPE.TEXT]
-    );
+    const headers = { host: url.host, 'user-agent': '' };
+    if (referer) headers.referer = referer;
 
-    // Fetch or select library path
-    let dbPath = await configDB.select('settings', ['value'], 'key="library_path"');
-    let libraryPath = dbPath?.value;
+    return await new Promise((resolve, reject) => {
+      https.get(url.href, { headers, timeout: 60000 }, res => {
+        const { statusCode } = res;
+        const chunks = [];
 
-    if (!libraryPath) {
-      const { canceled, filePaths } = await dialog.showOpenDialog({
-        title: 'Select a folder to store multimedia',
-        properties: ['openDirectory']
-      });
-
-      if (canceled || !filePaths?.[0]) return app.quit();
-
-      libraryPath = filePaths[0];
-      await configDB.insert('settings', ['key', 'library_path'], ['value', libraryPath]);
-    }
-
-    // Set library path and initialize the database module
-    databaseModule.library.directory = libraryPath;
-    await databaseModule.init();
-
-    const mainWindow = createWindow();
-
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+        if (statusCode === 200 && (!checkHeaders || checkHeaders(res.headers))) {
+          res.on('data', chunk => chunks.push(chunk));
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+        } else reject(new Error(`${statusCode} '${res.headers['content-type']}'`));
+      }).once('error', reject).once('abort', () => reject(new Error('Request aborted')));
     });
-
-    // IPC handlers
-    ipcMain.on('mainWindow:minimize', () => mainWindow.minimize());
-    ipcMain.on('mainWindow:close', () => mainWindow.close());
-
-    ipcMain.on('command:open', (_, target) => {
-      try {
-        const url = new URL(target);
-        child_process.exec(`${openCmd} "${url}"`);
-      } catch {
-        console.error('Invalid URL:', target);
-      }
-    });
-
-    ipcMain.on('social:repo', () =>
-      child_process.exec(`${openCmd} "https://github.com/lonezoneM/AnimePaheXtractor/"`)
-    );
-
-    ipcMain.handle('updater:check', async () => {
-      const result = { severity: 0, version: undefined };
-      try {
-        const update = await updater.checkForUpdates();
-        const [major, minor, patch] = versionArray(update.updateInfo.version);
-
-        result.version = update.updateInfo.version;
-        result.severity =
-          major > verMajor ? 3 :
-          minor > verMinor ? 2 :
-          patch > verPatch ? 1 : 0;
-      } catch (err) {
-        console.error(err);
-      }
-      return result;
-    });
-
-    updater.signals.progress(percent => {
-      mainWindow.webContents.send('updater:download-progress', percent);
-    });
-
-    ipcMain.handle('updater:download', async () => {
-      try {
-        await updater.downloadUpdate();
-        return true;
-      } catch (err) {
-        console.error(err);
-        return false;
-      }
-    });
-
-    ipcMain.on('updater:install', () => updater.quitAndInstall(true, true));
-
-    // Download IPC handlers
-    ipcMain.handle('download:start', async (_, { id, url, filename }) => {
-      const filepath = path.join(libraryPath, filename);
-      let existing = await downloadsDB.select('downloads', '*', `id='${id}'`);
-      if (!existing) {
-        await downloadsDB.insert('downloads',
-          ['id', id],
-          ['url', url],
-          ['filepath', filepath],
-          ['completedBytes', 0],
-          ['totalBytes', 0],
-          ['status', 'pending']
-        );
-      }
-      downloadFile(downloadsDB, id, url, filepath, (done, total) => {
-        mainWindow.webContents.send('download:progress', { id, done, total });
-      }).catch(err => {
-        console.error('Download error', err);
-      });
-      return true;
-    });
-
-    ipcMain.handle('download:resume-all', async () => {
-      const pendingDownloads = await downloadsDB.select('downloads', '*', `status!='completed'`, true);
-      for (const dl of pendingDownloads) {
-        downloadFile(downloadsDB, dl.id, dl.url, dl.filepath, (done, total) => {
-          mainWindow.webContents.send('download:progress', { id: dl.id, done, total });
-        }).catch(console.error);
-      }
-      return true;
-    });
-
   } catch (err) {
-    const msg = err instanceof Error ? err.stack || err.message : String(err);
-    dialog.showErrorBox("'Aw, snap!'", msg);
-    app.quit();
+    return new Error(`cannot gather such data: ${err.message}`);
   }
-});
+}
+
+/** ------------------ Serie Class ------------------ */
+class Serie {
+  static siblings = {};
+  static db;
+
+  static async init(db) {
+    this.db = db;
+    await this.db.createTable('series',
+      ['id', Database.TYPE.INTEGER],
+      ['details', Database.TYPE.TEXT],
+      ['poster', Database.TYPE.BLOB],
+      ['folder', Database.TYPE.TEXT],
+      ['range', Database.TYPE.TEXT]
+    );
+  }
+
+  static create(details) {
+    return this.siblings[details.id] = new Serie(details);
+  }
+
+  static getDetailsFromID(id) {
+    if (id in this.siblings) return this.siblings[id].details;
+    throw new Error(`Couldn't retrieve Serie ${id} from storage`);
+  }
+
+  _b64Poster;
+  get b64Poster() { return this._b64Poster; }
+  set b64Poster(value) { this._b64Poster = `data:image/*;base64,${value.toString('base64')}`; }
+
+  constructor({ id, session, title, episodes, poster }) {
+    this.id = id;
+    this.session = session;
+    this.details = { title, episodes, poster };
+    this.episodes = new Map();
+  }
+
+  async fetchPoster() {
+    if (!this.b64Poster) {
+      const buffer = await apRequest.fetch(this.details.poster, v => /image/.test(v));
+      if (buffer instanceof Error) throw buffer;
+      this.b64Poster = buffer;
+      await Serie.db.update('series', `id = ${this.id}`, ['poster', buffer]);
+    }
+    return this.b64Poster;
+  }
+
+  async fetchPage(pageNumber) {
+    const buffer = await apRequest.fetch(`https://animepahe.si/api?m=release&id=${this.session}&sort=episode_asc&page=${pageNumber}`);
+    const data = JSON.parse(buffer);
+    return data;
+  }
+
+  async fetchOptions(session) {
+    const buffer = await apRequest.fetch(`https://animepahe.si/api?m=links&id=${this.session}&session=${session}&p=kwik`);
+    const options = [];
+    for (const item of JSON.parse(buffer).data)
+      for (const key in item) { item[key].resolution = key; options.push(item[key]); }
+    return options;
+  }
+}
+
+/** ------------------ Extract Class (Consolidated) ------------------ */
+class Extract {
+  static siblings = {};
+  static db;
+
+  static async init(db) { this.db = db; }
+
+  static async create(serie, epList, preferred, updateStatus) {
+    if (await fs.access(library.directory, fs_consts.F_OK).catch(() => true))
+      return updateStatus('error', new Error(`folder "${library.directory}" doesn't exist`));
+
+    const folder = serie.folder || serie.details.title.replace(/[^\w\s]/g, '_').replace(/\s/g, '-');
+    serie.folder = folder;
+    await Serie.db.update('series', `id = ${serie.id}`, ['folder', folder]);
+
+    const currentDir = path.join(library.directory, folder);
+    if (await fs.access(currentDir, fs_consts.F_OK).catch(() => true))
+      await fs.mkdir(path.join(currentDir, '.data'), { recursive: true });
+
+    const extract = new Extract(serie, currentDir, updateStatus);
+    extract.queue(epList, preferred);
+  }
+
+  constructor(serie, currentDir, updateStatus) {
+    this.serie = serie;
+    this.currentDir = currentDir;
+    this.updateStatus = updateStatus;
+    this.list = new Set();
+    this.queued = [];
+    this.queueEvent = new EventEmitter();
+    this.symbolUpdate = Symbol();
+    this.maxSlots = 7;
+    this.runQueue();
+  }
+
+  async queue(epList, preferred) {
+    const list = new Set(epList.split(',').map(n => +n));
+    for (const ep of list) {
+      if (!this.list.has(ep)) {
+        this.list.add(ep);
+        this.queued.push([ep, preferred]);
+      }
+    }
+    this.queueEvent.emit(this.symbolUpdate);
+    this.updateStatus('left', this.queued.length);
+  }
+
+  async fetchEpisodeOptions(session) {
+    const buffer = await sendRequest({
+      url: new URL(`https://animepahe.si/api?m=links&id=${this.serie.session}&session=${session}&p=kwik`),
+      referer: defReferer
+    });
+    const data = JSON.parse(buffer).data;
+    if (!data?.length) throw new Error('No episode options found');
+    const options = [];
+    data.forEach(opt => {
+      for (const res in opt) {
+        opt[res].resolution = res;
+        options.push(opt[res]);
+      }
+    });
+    return options;
+  }
+
+  getBestMatch(options, { audio = 'jpn', quality = Infinity }) {
+    if (!options.length) throw new Error('No options to choose from');
+    const tree = options.reduce((p, c) => {
+      p[c.audio] = p[c.audio] || {};
+      p[c.audio][c.resolution] = c.kwik;
+      return p;
+    }, {});
+    const branch = tree[audio] || tree['jpn'] || tree[Object.keys(tree)[0]];
+    const resKeys = Object.keys(branch).map(k => +k).sort((a, b) => a - b);
+    const closest = resKeys.reduce((prev, curr) => Math.abs(curr - quality) < Math.abs(prev - quality) ? curr : prev);
+    const url = branch[closest];
+    return [new URL(url).href, options.find(o => o.kwik.includes(url))];
+  }
+
+  async parseM3U(streamURL, episodeTempDir) {
+    const M3UPath = path.join(episodeTempDir, '.m3u8');
+    const StatusPath = path.join(episodeTempDir, 'status');
+    let status = {};
+    let M3Umetadata = {};
+    try {
+      status = await unpackJSON(await fs.readFile(StatusPath));
+      const existingM3U = await fs.readFile(M3UPath, 'utf-8');
+      const metaMatch = existingM3U.match(/#EXT-X-METADATA:(.+)/);
+      if (metaMatch) M3Umetadata = await unpackJSON(Buffer.from(metaMatch[1], 'base64'));
+    } catch { /* no resume */ }
+
+    if (!M3Umetadata.streamURL || M3Umetadata.streamURL !== streamURL.href) {
+      const m3uBuffer = await sendRequest({ url: streamURL, referer: defReferer });
+      const m3uText = m3uBuffer.toString();
+      const XKEYMatch = m3uText.match(/#EXT-X-KEY:(.+)/);
+      let keyBuffer = null;
+      if (XKEYMatch) {
+        const keyProps = XKEYMatch[1].split(',').reduce((p, c) => {
+          const [k, v] = c.replace(/"/g, '').split('=');
+          p[k] = v;
+          return p;
+        }, {});
+        if (keyProps.URI) keyBuffer = await sendRequest({ url: new URL(keyProps.URI), referer: defReferer });
+      }
+      const segments = (m3uText.match(/#EXTINF:[^\n]+\n(.+)/g) || []).map(line => line.split('\n')[1]);
+      if (!segments.length) throw new Error('No segments found');
+      status = {};
+      segments.forEach((url, i) => status[i] = { url });
+      M3Umetadata = { streamURL: streamURL.href, count: segments.length, key: keyBuffer?.toString('base64') };
+      await fs.writeFile(M3UPath, `${segments.join('\n')}\n#EXT-X-METADATA:${(await packJSON(M3Umetadata)).toString('base64')}`);
+      await fs.writeFile(StatusPath, await packJSON(status));
+    }
+    return { segments: Object.keys(status).map(k => status[k].url), keyBuffer: M3Umetadata.key ? Buffer.from(M3Umetadata.key, 'base64') : null, status, StatusPath, M3UPath, M3Umetadata };
+  }
+
+  async downloadSegment(url, filePath) {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const writeStream = (await fs.open(filePath, 'a')).createWriteStream();
+    return new Promise((resolve, reject) => {
+      https.get(url, { headers: { Referer: defReferer, 'User-Agent': 'AnimePaheXtractor' } }, res => {
+        res.pipe(writeStream);
+        res.on('end', resolve);
+        res.on('error', reject);
+      }).on('error', reject);
+    });
+  }
+
+  async compileToMP4(m3uPath, outputFile) {
+    return new Promise((resolve, reject) => {
+      ffmpeg()
+        .addInput(m3uPath)
+        .inputOptions('-allowed_extensions ALL')
+        .videoCodec('copy')
+        .audioCodec('copy')
+        .output(outputFile)
+        .on('error', reject)
+        .on('end', resolve)
+        .run();
+    });
+  }
+
+  async runQueue() {
+    while (true) {
+      await new Promise(r => this.queueEvent.once(this.symbolUpdate, () => r(true)));
+      const slots = [];
+      const trouble = [];
+      while (this.queued.length > 0) {
+        while (slots.length < this.maxSlots && this.queued.length > 0) {
+          const [num, preferred] = this.queued.shift();
+          slots.push(this.processEpisode(num, preferred).catch(err => {
+            trouble.push({ num, err });
+          }));
+        }
+        await Promise.race(slots);
+        slots.splice(0, slots.length, ...slots.filter(p => p.isPending));
+      }
+      if (trouble.length) {
+        this.updateStatus('error', `${trouble.length} episodes failed`);
+      }
+    }
+  }
+
+  async processEpisode(num, preferred) {
+    try {
+      this.updateStatus('current', num);
+      const ep = this.serie.episodes.get(num);
+      if (!ep) throw new Error(`Episode ${num} missing`);
+      const outputFile = path.join(this.currentDir, `${num}.mp4`);
+      const episodeTempDir = path.join(this.currentDir, '.data', String(num));
+      if (await fs.access(outputFile).then(() => true, () => false)) {
+        this.updateStatus('progress', 1);
+        this.updateStatus('completed', num);
+        return;
+      }
+      await fs.mkdir(episodeTempDir, { recursive: true });
+      const options = await this.fetchEpisodeOptions(ep.session);
+      const [url] = this.getBestMatch(options, preferred);
+      const { segments, status, StatusPath } = await this.parseM3U(new URL(url), episodeTempDir);
+      for (const i of Object.keys(status)) {
+        if (!status[i].done) {
+          const segPath = path.join(episodeTempDir, `${i}.ts`);
+          await this.downloadSegment(status[i].url, segPath);
+          status[i].done = true;
+          await fs.writeFile(StatusPath, await packJSON(status));
+          this.updateStatus('progress', (Object.keys(status).filter(k => status[k].done).length) / segments.length);
+        }
+      }
+      await this.compileToMP4(path.join(episodeTempDir, '.m3u8'), outputFile);
+      await fs.rm(episodeTempDir, { recursive: true, force: true });
+      this.updateStatus('completed', num);
+    } catch (err) {
+      this.updateStatus('error', err.message);
+      throw err;
+    }
+  }
+}
+
+/** ------------------ Export Module ------------------ */
+module.exports = {
+  init,
+  library,
+  Serie,
+  Extract,
+  apRequest,
+  sendRequest,
+  Database,
+};
