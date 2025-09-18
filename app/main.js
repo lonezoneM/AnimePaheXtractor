@@ -1,60 +1,70 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
-const fs = require('fs');
-const https = require('https');
 const { AppImageUpdater, MacUpdater, NsisUpdater } = require('electron-updater');
+const { Database } = require('./database');
+
+// open command
 const child_process = require('child_process');
-
-const databaseModule = require('./database');
-const { Database } = require('./database'); // Correctly import the Database class here
-
-// Open external files/URLs safely
-const openCmd = (() => {
+const open = (() => {
   switch (process.platform) {
-    case 'win32': return 'start';
-    case 'darwin': return 'open';
-    default: return 'xdg-open';
+    case "win32":
+      return "start";
+    case "darwin":
+      return "open";
+    case "linux":
+      return "xdg-open";
   }
 })();
 
-// Configure updater
 const updater = (() => {
-  const options = {
+  let u, options = {
+    requestHeaders: {
+      'Cache-Control': 'no-cache, no-store, must-revalidate'
+    },
     provider: 'github',
-    owner: 'lonezoneM',
+    owner: 'ZReC',
     repo: 'AnimePaheXtractor',
-    requestHeaders: { 'Cache-Control': 'no-cache, no-store, must-revalidate' }
   };
 
-  let u;
   switch (process.platform) {
-    case 'win32': u = new NsisUpdater(options); break;
-    case 'darwin': u = new MacUpdater(options); break;
-    default: u = new AppImageUpdater(options);
+    case "win32":
+      u = new NsisUpdater(options);
+      break;
+    case "darwin":
+      u = new MacUpdater(options);
+      break;
+    default:
+      u = new AppImageUpdater(options);
   }
 
   u.autoDownload = false;
   u.autoInstallOnAppQuit = true;
+
   return u;
 })();
 
-// Ensure single instance
-if (!app.requestSingleInstanceLock()) app.quit();
+const lockInstance = app.requestSingleInstanceLock();
+if (!lockInstance)
+  app.quit();
 
-const isDev = process.argv.includes('--dev');
+const isDev = process.argv[2] == '--dev';
 
-// Version parsing helper
 function versionArray(str) {
-  const match = str.match(/^(\d+)\.(\d+)\.(\d+)$/);
-  if (!match) throw new Error(`Invalid version string: ${str}`);
-  return match.slice(1, 4).map(n => BigInt(n));
+  const found = str.match(/([0-9]+).([0-9]+).([0-9]+)/);
+  if (found.length != 4)
+    throw new Error("invalid version");
+
+  let arr = [];
+  for (let i = 1; i < 4; i++) {
+    arr.push(BigInt(found[i]));
+  }
+  return arr;
 }
 
 const [verMajor, verMinor, verPatch] = versionArray(app.getVersion());
 
-// Create main BrowserWindow
 function createWindow() {
-  const rendererPath = path.join(__dirname, 'renderer', 'index');
+  const pathIndex = path.join(__dirname, 'renderer', 'index');
 
   const mainWindow = new BrowserWindow({
     width: 800,
@@ -65,138 +75,130 @@ function createWindow() {
     show: false,
     backgroundColor: '#0000',
     webPreferences: {
-      preload: path.join(rendererPath, 'preload.js'),
+      preload: path.join(pathIndex, 'preload.js'),
       sandbox: true
     }
   });
 
   app.on('second-instance', () => {
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (mainWindow.isMinimized())
+        mainWindow.restore();
       mainWindow.focus();
     }
+
   });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
-  mainWindow.once('closed', () => app.quit());
-  mainWindow.loadFile(path.join(rendererPath, 'index.html'));
+  // Close all windows when main is gone
+  mainWindow.once('closed', () => { app.quit(); });
 
-  if (isDev) mainWindow.webContents.openDevTools();
+  mainWindow.once('ready-to-show', () => { mainWindow.show(); });
+
+  // Load index.html
+  mainWindow.loadFile(path.join(pathIndex, 'index.html'));
+
+  if (isDev)
+    mainWindow.webContents.openDevTools();
 
   return mainWindow;
 }
 
-// Download with resume support
-async function downloadFile(db, downloadId, url, filepath, onProgress) {
-  await fs.promises.mkdir(path.dirname(filepath), { recursive: true });
-
-  let record = await db.select('downloads', '*', `id='${downloadId}'`);
-  let start = record?.completedBytes || 0;
-
-  const fileStream = fs.createWriteStream(filepath, { flags: start ? 'r+' : 'w', start });
-  const options = { headers: {} };
-  if (start) options.headers['Range'] = `bytes=${start}-`;
-
-  return new Promise((resolve, reject) => {
-    https.get(url, options, async res => {
-      const total = parseInt(res.headers['content-length'] || '0') + start;
-      res.on('data', async chunk => {
-        fileStream.write(chunk);
-        start += chunk.length;
-        onProgress(start, total);
-        await db.update('downloads', `id='${downloadId}'`, ['completedBytes', start], ['totalBytes', total]);
-      });
-
-      res.on('end', async () => {
-        fileStream.close();
-        await db.update('downloads', `id='${downloadId}'`, ['completedBytes', total], ['status', 'completed']);
-        resolve();
-      });
-
-      res.on('error', err => {
-        fileStream.close();
-        reject(err);
-      });
-    });
-  });
-}
-
-// App ready
+/** 
+ * This method will be called when Electron has finished
+ * initialization and is ready to create browser windows.
+ * Some APIs can only be used after this event occurs.
+ */
 app.whenReady().then(async () => {
   try {
-    // Open or create config DB
+    // setup config database
     const configDB = await Database.open('config');
-    await configDB.createTable(
-      'settings',
-      ['key', Database.TYPE.TEXT],
-      ['value', Database.TYPE.BLOB]
-    );
+    await configDB.createTable('settings', ['key', Database.TYPE.TEXT], ['value', Database.TYPE.BLOB]);
+    let path = await configDB.select('settings', ['value'], 'key="library_path"');
 
-    // Open or create downloads DB
-    const downloadsDB = await Database.open('downloads');
-    await downloadsDB.createTable(
-      'downloads',
-      ['id', Database.TYPE.TEXT],
-      ['url', Database.TYPE.TEXT],
-      ['filepath', Database.TYPE.TEXT],
-      ['completedBytes', Database.TYPE.NUMERIC],
-      ['totalBytes', Database.TYPE.NUMERIC],
-      ['status', Database.TYPE.TEXT]
-    );
+    if (!path) {
+      let library_path;
+      do {
+        const { canceled, filePaths } = await dialog.showOpenDialog(undefined, {
+          title: 'Select a folder to store multimedia! (>.<)/',
+          properties: ['openDirectory'],
+          message: 'OwO'
+        });
 
-    // Fetch or select library path
-    let dbPath = await configDB.select('settings', ['value'], 'key="library_path"');
-    let libraryPath = dbPath?.value;
+        if (!canceled)
+          library_path = filePaths?.at(0);
+      } while (library_path == undefined);
 
-    if (!libraryPath) {
-      const { canceled, filePaths } = await dialog.showOpenDialog({
-        title: 'Select a folder to store multimedia',
-        properties: ['openDirectory']
-      });
-
-      if (canceled || !filePaths?.[0]) return app.quit();
-
-      libraryPath = filePaths[0];
-      await configDB.insert('settings', ['key', 'library_path'], ['value', libraryPath]);
+      await configDB.insert('settings', ['key', 'library_path'], ['value', library_path]);
+      path = await configDB.select('settings', ['value'], 'key = "library_path"');
     }
+    const a_p = require('./apextractor');
 
-    // Set library path and initialize the main database module
-    databaseModule.library.directory = libraryPath;
-    await databaseModule.init();
+    a_p.library.directory = path.value;
 
     const mainWindow = createWindow();
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      // On macOS it's common to re-create a window in the app when the
+      // dock icon is clicked and there are no other windows open.
+      if (BrowserWindow.getAllWindows().length === 0)
+        createWindow();
     });
 
-    // IPC handlers from the old database.js file
-    ipcMain.handle('serie:getDetailsFromID', (_, id) => {
-        try { return databaseModule.Serie.getDetailsFromID(id); }
-        catch (err) { return err; }
+    ipcMain.on('mainWindow:minimize', () => {
+      mainWindow.minimize();
+    });
+    ipcMain.on('mainWindow:close', () => {
+      mainWindow.close();
     });
 
-    ipcMain.handle('serie:fetchPoster', async (_, id) => {
-        try { return await databaseModule.Serie.siblings[id].fetchPoster(); }
-        catch (err) { return err; }
+    ipcMain.on('command:open', (_, what) => {
+      const url = new URL(what);
+      child_process.exec(`${open} ${url}`);
     });
 
-    ipcMain.handle('extract:start', ({ sender }, serieID, epList, preferred) => {
-        try {
-            const serie = databaseModule.Serie.siblings[serieID];
-            if (!serie) throw new Error('Serie not found');
-            databaseModule.Extract.create(serie, epList, preferred, (type, msg) => sender.send(`extract:updateStatus:${serieID}`, [type, msg]));
-            return `Extraction started for "${serie.details.title}"`;
-        } catch (err) { return err; }
+    // Hardcoded current github repo
+    ipcMain.on('social:repo', () => child_process.exec(`${open} https://github.com/lonezoneM/AnimePaheXtractor/`));
+
+    ipcMain.handle('updater:check', async () => {
+      const r = { severity: 0, version: undefined };
+      try {
+        const result = await updater.checkForUpdates();
+        const [major, minor, patch] = versionArray(result.updateInfo.version);
+
+        r.version = result.updateInfo.version;
+        r.severity =
+          major > verMajor && 3 ||
+          minor > verMinor && 2 ||
+          patch > verPatch && 1 || 0;
+      } catch (e) {
+        console.error(e);
+      }
+
+      return r;
     });
 
-    // The other IPC handlers in main.js remain the same
-    ipcMain.on('mainWindow:minimize', () => mainWindow.minimize());
-    ipcMain.on('mainWindow:close', () => mainWindow.close());
-    // ... (rest of the IPC handlers from main.js)
+    updater.signals.progress(p => {
+      mainWindow.webContents.send('updater:download-progress', p.percent);
+    });
+
+    ipcMain.handle('updater:download', async () => {
+      try {
+        await updater.downloadUpdate();
+        return true;
+      } catch (e) {
+        console.error(e);
+        return false;
+      }
+    });
+
+    ipcMain.on('updater:install', () => {
+      updater.quitAndInstall(true, true);
+    });
+
   } catch (err) {
-    const msg = err instanceof Error ? err.stack || err.message : String(err);
-    dialog.showErrorBox("'Aw, snap!'", msg);
+    dialog.showErrorBox(`'Aw, snap!': The Animation`, err instanceof Error
+      ? err.stack || err.message
+      : 'Unknown error!');
     app.quit();
   }
 });
