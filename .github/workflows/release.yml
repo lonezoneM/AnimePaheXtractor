@@ -2,9 +2,12 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches:
+      - main       # runs on every push to main
+  workflow_dispatch: # manual trigger
+
+permissions:
+  contents: write   # needed to create/update release
 
 jobs:
   build:
@@ -15,22 +18,33 @@ jobs:
         working-directory: ./app
 
     steps:
-      - uses: actions/checkout@v2
+      # 1️⃣ Checkout repository
+      - uses: actions/checkout@v4
+
+      # 2️⃣ Setup Node and cache Yarn dependencies
       - uses: actions/setup-node@v4
         with:
           node-version: 18.x
           cache: "yarn"
-          cache-dependency-path: app/yarn.lock
+          cache-dependency-path: app/yarn.lock   # relative to repo root
+
+      # 3️⃣ Install dependencies
       - run: yarn install --frozen-lockfile
+
+      # 4️⃣ Build the project (produces .exe in build folder)
       - run: yarn run dist
-      - uses: "marvinpinto/action-automatic-releases@latest"
+
+      # 5️⃣ Create or update a GitHub Release called "latest"
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
         with:
-          prerelease: false
-          repo_token: "${{ secrets.GITHUB_TOKEN }}"
-          automatic_release_tag: latest  
+          tag_name: latest       # release tag
+          name: Latest Release   # release name
           files: |
             readme.md
             license.md
             build/*.exe
             build/*.blockmap
             build/latest.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
