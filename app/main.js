@@ -158,9 +158,10 @@ app.whenReady().then(async () => {
       await configDB.insert('settings', ['key', 'library_path'], ['value', libraryPath]);
     }
 
-    // Set library path in apextractor
+    // Set library path in apextractor and initialize it here
     const apextractor = require('./apextractor');
     apextractor.library.directory = libraryPath;
+    await apextractor.init(); // <--- Added initialization here
 
     const mainWindow = createWindow();
 
