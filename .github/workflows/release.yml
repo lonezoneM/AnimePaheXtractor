@@ -27,6 +27,7 @@ jobs:
         with:
           prerelease: false
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          automatic_release_tag: latest  
           files: |
             readme.md
             license.md
