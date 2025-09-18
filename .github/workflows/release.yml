@@ -20,7 +20,7 @@ jobs:
         with:
           node-version: 18.x
           cache: "yarn"
-          cache-dependency-path: yarn.lock
+          cache-dependency-path: app/yarn.lock
       - run: yarn install --frozen-lockfile
       - run: yarn run dist
       - uses: "marvinpinto/action-automatic-releases@latest"
