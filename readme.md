@@ -18,7 +18,7 @@
 
 ```0b101``` Press "eXtract" & *chill*
 
-```0b110``` *With great power comes great responsibility.* Don't abuse, AnimePahe is a great site to enjoy the waifu, (there's no comment section, and that's what I love the most).
+```0b110``` *With great power comes great responsibility.* Don't abuse, AnimePahe is a great site to enjoyshows.
 
 ```0b111``` GOTO [0b011](#0b011)
 
