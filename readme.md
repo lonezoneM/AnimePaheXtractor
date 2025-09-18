@@ -27,3 +27,6 @@
 Reporting bugs or malfunctioning features is encouraged!\
 May you want to pull request some fixes?
 
+##
+Original script : https://github.com/ZReC/AnimePaheXtractor
+
