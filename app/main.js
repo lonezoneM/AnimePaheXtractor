@@ -1,21 +1,10 @@
-There's an issue with the provided files. The `database.js` file is trying to import itself, which will cause a recursive error. Additionally, both `apextractor.js` and `database.js` define their own `Extractor` or `Extract` classes, leading to redundancy and potential conflicts. The `main.js` file also has a line that tries to require `apextractor.js` and call an `init` method that doesn't exist within that file's export.
-
-To fix the `main.js` file, you need to consolidate the logic from the other files and ensure dependencies are handled correctly. The main goal is to have `main.js` handle the core Electron application logic and delegate the database and extraction setup to a single, consistent module.
-
-Here is a corrected `main.js` that assumes the following:
-
-  * The `database.js` file has been refactored to be the central point of truth for database and extraction logic.
-  * The `apextractor.js` file is no longer needed, as its functionality has been merged into `database.js`.
-
-<!-- end list -->
-
-```javascript
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
 const { AppImageUpdater, MacUpdater, NsisUpdater } = require('electron-updater');
-const { Database } = require('./database');
+const databaseModule = require('./database'); // Import the main database module
+const { Database } = databaseModule;
 const child_process = require('child_process');
 
 // Open external files/URLs safely
@@ -170,8 +159,7 @@ app.whenReady().then(async () => {
       await configDB.insert('settings', ['key', 'library_path'], ['value', libraryPath]);
     }
 
-    // Set library path and initialize the main database module
-    const databaseModule = require('./database');
+    // Set library path and initialize the database module
     databaseModule.library.directory = libraryPath;
     await databaseModule.init();
 
@@ -269,4 +257,3 @@ app.whenReady().then(async () => {
     app.quit();
   }
 });
-```
