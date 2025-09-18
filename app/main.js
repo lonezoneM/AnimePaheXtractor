@@ -6,6 +6,7 @@ const { AppImageUpdater, MacUpdater, NsisUpdater } = require('electron-updater')
 const child_process = require('child_process');
 
 const databaseModule = require('./database');
+const { Database } = require('./database'); // Correctly import the Database class here
 
 // Open external files/URLs safely
 const openCmd = (() => {
@@ -124,23 +125,23 @@ async function downloadFile(db, downloadId, url, filepath, onProgress) {
 app.whenReady().then(async () => {
   try {
     // Open or create config DB
-    const configDB = await databaseModule.Database.open('config');
+    const configDB = await Database.open('config');
     await configDB.createTable(
       'settings',
-      ['key', databaseModule.Database.TYPE.TEXT],
-      ['value', databaseModule.Database.TYPE.BLOB]
+      ['key', Database.TYPE.TEXT],
+      ['value', Database.TYPE.BLOB]
     );
 
     // Open or create downloads DB
-    const downloadsDB = await databaseModule.Database.open('downloads');
+    const downloadsDB = await Database.open('downloads');
     await downloadsDB.createTable(
       'downloads',
-      ['id', databaseModule.Database.TYPE.TEXT],
-      ['url', databaseModule.Database.TYPE.TEXT],
-      ['filepath', databaseModule.Database.TYPE.TEXT],
-      ['completedBytes', databaseModule.Database.TYPE.NUMERIC],
-      ['totalBytes', databaseModule.Database.TYPE.NUMERIC],
-      ['status', databaseModule.Database.TYPE.TEXT]
+      ['id', Database.TYPE.TEXT],
+      ['url', Database.TYPE.TEXT],
+      ['filepath', Database.TYPE.TEXT],
+      ['completedBytes', Database.TYPE.NUMERIC],
+      ['totalBytes', Database.TYPE.NUMERIC],
+      ['status', Database.TYPE.TEXT]
     );
 
     // Fetch or select library path
