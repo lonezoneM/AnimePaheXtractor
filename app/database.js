@@ -1,249 +1,120 @@
-const { app, BrowserView, ipcMain } = require('electron');
-const https = require('https');
-const { PassThrough, EventEmitter } = require('stream');
+const { Database: DriverDatabase } = require('sqlite3');
+const sqlite = require('sqlite');
 const { promises: fs, constants: fs_consts } = require('fs');
-const path = require('path');
-const zlib = require('zlib');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpacked');
 
-// Define the Database class directly here to avoid a missing file error.
-// The code below is a placeholder. You need to replace this with the actual implementation
-// of your Database class, including its methods like `open` and `createTable`, as
-// these are used later in the file.
 class Database {
-    static TYPE = {
-        TEXT: 'TEXT',
-        INTEGER: 'INTEGER',
-        BLOB: 'BLOB',
-        NUMERIC: 'NUMERIC'
-    };
+  /** @type {Database[]} */
+  static siblings = [];
 
-    static async open(name) {
-        // ... actual implementation to open a database
-    }
+  /**
+   * @param {string} name
+   * @returns {Promise<Database|Error>}
+   */
+  static async open(name) {
+    try {
+      if (await fs.access('data', fs_consts.F_OK).catch(() => true))
+        await fs.mkdir('data');
 
-    async createTable(tableName, ...columns) {
-        // ... actual implementation to create a table
-    }
-
-    // ... other methods like select, update, insert
-}
-
-
-ffmpeg.setFfmpegPath(ffmpegPath);
-
-const defReferer = 'https://kwik.cx';
-const defContentType = 'application/json';
-
-/** ------------------ Media Library ------------------ */
-const library = {
-  _db: null,
-  _directory: null,
-
-  get directory() { return this._directory; },
-  set directory(path) { this._directory = path; },
-
-  get database() { return this._db; },
-  set database(db) { this._db = db; },
-
-  async init() {
-    this.database = await Database.open('ap');
+      if (Database.siblings[name] == undefined)
+        this.siblings[name] = new Database(await sqlite.open({ filename: `data/${name}.db3`, driver: DriverDatabase }));
+      return this.siblings[name];
+    } catch (err) { return err; }
   }
-};
 
-/** ------------------ AP Request Manager ------------------ */
-const apRequest = {
-  view: null,
-  completedEvent: new EventEmitter(),
-  completedSymbol: Symbol(),
-  prepareViewPromise: null,
+  /**
+   * @param {string} name 
+   * @returns {boolean}
+   */
+  static close(name) {
+    if (this.siblings[name] instanceof Database) {
+      this.siblings[name].close();
+      delete this.siblings[name];
+    } else
+      return false;
 
-  init() {
-    this.view = new BrowserView({ webPreferences: { sandbox: true } });
-    this.view.webContents.session.webRequest
-      .onHeadersReceived({ urls: ['https://*.animepahe.com/*'] }, (details, callback) => {
-        callback({
-          responseHeaders: {
-            ...details.responseHeaders,
-            'Content-Security-Policy': [`default-src 'self' 'unsafe-inline' 'unsafe-eval' *.animepahe.com`],
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-      });
-
-    this.view.webContents.session.webRequest
-      .onCompleted({ urls: ['https://animepahe.si/api?*'] }, details => {
-        if (details.statusCode === 200) {
-          this.completedEvent.emit(this.completedSymbol);
-        }
-      });
-
-    this.tasks = [
-      () => this.prepareView(),
-      async () => {
-        await this.view.webContents.session.clearStorageData();
-        return this.prepareView();
-      }
-    ];
-  },
-
-  async prepareView() {
-    if (this.prepareViewPromise) return this.prepareViewPromise;
-    this.prepareViewPromise = new Promise(resolve =>
-      this.completedEvent.once(this.completedSymbol, () => resolve(true))
-    );
-    this.view.webContents.loadURL('https://animepahe.si/api?m=airing&page=1');
-    const outcome = await Promise.race([
-      this.prepareViewPromise,
-      new Promise(r => setTimeout(r, 30000, new Error('request timeout')))
-    ]);
-    this.prepareViewPromise = null;
-    this.completedEvent.removeAllListeners(this.completedSymbol);
-    return outcome;
-  },
-
-  async fetch(url, test = v => /application\/json/.test(v)) {
-    let attempts = 3;
-    const tasks = this.tasks.values();
-    let result;
-
-    while (attempts-- > 0) {
-      try {
-        result = await Promise.race([
-          this.view.webContents.executeJavaScript(
-            `fetch('${new URL(url).href}').then(r => Promise.all([r.headers.get('content-type'), r.arrayBuffer()]))`
-          ),
-          new Promise(r => setTimeout(r, 10000, new Error('request timeout')))
-        ]);
-      } catch (e) { result = e; }
-
-      if (Array.isArray(result) && test(result[0])) {
-        return Buffer.from(result[1]);
-      }
-
-      const task = tasks.next();
-      if (!task.done) await task.value();
-    }
-
-    return result instanceof Error ? result : new Error('fetch failed');
+    return true;
   }
-};
 
-/** ------------------ Utility Requests & Data ------------------ */
-async function sendRequest({ hostname = 'animepahe.si', path, url, referer, checkHeaders = h => h['content-type'] === defContentType }) {
-  try {
-    if (!url) url = new URL(`https://${hostname}${path}`);
-    else if (!(url instanceof URL)) url = new URL(url);
-    const headers = { host: url.host, 'user-agent': '' };
-    if (referer) headers.referer = referer;
-    return await new Promise((resolve, reject) => {
-      https.get(url.href, { headers, timeout: 60000 }, res => {
-        const { statusCode } = res;
-        const chunks = [];
-        if (statusCode === 200 && (!checkHeaders || checkHeaders(res.headers))) {
-          res.on('data', chunk => chunks.push(chunk));
-          res.on('end', () => resolve(Buffer.concat(chunks)));
-        } else reject(new Error(`${statusCode} '${res.headers['content-type']}'`));
-      }).once('error', reject).once('abort', () => reject(new Error('Request aborted')));
-    });
-  } catch (err) {
-    return new Error(`cannot gather such data: ${err.message}`);
-  }
-}
+  static TYPE = Object.freeze({
+    TEXT: 0,
+    NUMERIC: 1,
+    INTEGER: 2,
+    REAL: 3,
+    BLOB: 4
+  });
 
-const packJSON = obj =>
-  new Promise((res, rej) =>
-    zlib.deflate(JSON.stringify(obj), (err, buf) => err ? rej(err) : res(buf))
-  );
-
-const unpackJSON = buf =>
-  new Promise((res, rej) =>
-    zlib.inflate(buf, (err, data) => err ? rej(err) : res(JSON.parse(data.toString())))
-  );
-
-
-/** ------------------ Serie Class ------------------ */
-class Serie {
-  static siblings = {};
-  static db;
-
-  static async init(db) {
+  constructor(db) {
+    /** @type {sqlite.Database} */
     this.db = db;
-    await this.db.createTable('series',
-      ['id', Database.TYPE.INTEGER],
-      ['details', Database.TYPE.TEXT],
-      ['poster', Database.TYPE.BLOB],
-      ['folder', Database.TYPE.TEXT],
-      ['range', Database.TYPE.TEXT]
-    );
   }
 
-  static create(details) {
-    return this.siblings[details.id] = new Serie(details);
+  close() {
+    this.db.close();
   }
 
-  static getDetailsFromID(id) {
-    if (id in this.siblings) return this.siblings[id].details;
-    throw new Error(`Couldn't retrieve Serie ${id} from storage`);
+  getType(num) {
+    switch (num) {
+      case 0:
+        return 'TEXT';
+      case 1:
+        return 'NUMERIC';
+      case 2:
+        return 'INTEGER';
+      case 3:
+        return 'REAL';
+      case 4:
+        return 'BLOB';
+      default:
+        throw new Error('invalid type');
+    }
   }
 
-  // ... (rest of the Serie class remains the same)
+  createTable(name, ...args) {
+    let query = `CREATE TABLE IF NOT EXISTS ${name}(`;
+    args.forEach(v => {
+      query += `${v[0]} ${this.getType(v[1])},`;
+    });
+    query += `PRIMARY KEY (${args[0][0]})) WITHOUT ROWID`;
+
+    return this.db.run(query);
+  }
+
+  select(from, cols, where, all = false) {
+    let query = `SELECT `;
+    query += cols
+      ? cols instanceof Array
+        ? cols.join(',')
+        : cols
+      : '*';
+    query += ` FROM ${from}`;
+
+    if (where)
+      query += ` WHERE ${where}`;
+
+    return this.db[(all ? 'all' : 'get')](query);
+  };
+
+  insert(name, ...args) {
+    let query = `INSERT INTO ${name}(`;
+    let [cols, values] = args.reduce((p, c) => {
+      p[0] += `,${c[0]}`;
+      p[1].push(c[1]);
+      return p;
+    }, ['', []]);
+    query += `${cols.slice(1)}) VALUES (${values.reduce(p => `${p},?`, '').slice(1)})`;
+    return this.db.run(query, ...values);
+  };
+
+  update(name, where, ...args) {
+    let query = `UPDATE ${name} `;
+    let [cols, values] = args.reduce((p, c) => {
+      p[0] += `,${c[0]} = ?`;
+      p[1].push(c[1]);
+      return p;
+    }, ['', []]);
+    query += `SET ${cols.slice(1)} WHERE ${where}`;
+    return this.db.run(query, ...values);
+  }
 }
 
-/** ------------------ Extractor Class (Consolidated) ------------------ */
-class Extract {
-  static siblings = {};
-  static db;
-
-  static async init(db) { this.db = db; }
-
-  static async create(serie, epList, preferred, updateStatus) {
-    // ... (rest of the create method)
-  }
-
-  constructor(serie, currentDir, updateStatus) {
-    // ... (rest of the constructor)
-  }
-
-  // ... (rest of the methods from apextractor.js should be merged here)
-}
-
-/** ------------------ Initialize & IPC Handlers ------------------ */
-// The `app.on('ready', ...)` block should be in main.js
-// so that database and IPC handlers are only set up after the app is ready.
-async function init() {
-  apRequest.init();
-  await library.init();
-  await Serie.init(library.database);
-  await Extract.init(library.database);
-}
-
-ipcMain.handle('serie:getDetailsFromID', (_, id) => {
-  try { return Serie.getDetailsFromID(id); }
-  catch (err) { return err; }
-});
-
-ipcMain.handle('serie:fetchPoster', async (_, id) => {
-  try { return await Serie.siblings[id].fetchPoster(); }
-  catch (err) { return err; }
-});
-
-ipcMain.handle('extract:start', ({ sender }, serieID, epList, preferred) => {
-  try {
-    const serie = Serie.siblings[serieID];
-    if (!serie) throw new Error('Serie not found');
-    Extract.create(serie, epList, preferred, (type, msg) => sender.send(`extract:updateStatus:${serieID}`, [type, msg]));
-    return `Extraction started for "${serie.details.title}"`;
-  } catch (err) { return err; }
-});
-
-module.exports = {
-  init,
-  library,
-  Serie,
-  Extract,
-  apRequest,
-  sendRequest,
-  Database
-};
+module.exports.Database = Database;
