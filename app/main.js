@@ -22,7 +22,7 @@ const updater = (() => {
       'Cache-Control': 'no-cache, no-store, must-revalidate'
     },
     provider: 'github',
-    owner: 'ZReC',
+    owner: 'lonezoneM',
     repo: 'AnimePaheXtractor',
   };
 
@@ -157,7 +157,7 @@ app.whenReady().then(async () => {
     });
 
     // Hardcoded current github repo
-    ipcMain.on('social:repo', () => child_process.exec(`${open} https://github.com/lonezoneM/AnimePaheXtractor/`));
+    ipcMain.on('social:repo', () => child_process.exec(`${open} https://github.com/lonezoneM/AnimePaheXtractor`));
 
     ipcMain.handle('updater:check', async () => {
       const r = { severity: 0, version: undefined };
