@@ -487,6 +487,24 @@ class SearchResult {
     if (!(searchResult && searchResult.expires > Date.now())) {
       const result = await apRequest.fetch(`https://animepahe.si/api?m=search\&l=8\&q=${query}`);
 
+      // --- PATCH START: Log the API response ---
+    try {
+      if (result instanceof Buffer) {
+        // If result is a Buffer, convert to string
+        const responseText = result.toString('utf8');
+        console.log(`[DEBUG] Search API response for query "${query}":`, responseText);
+
+        // Optionally, write to a file for persistent logs
+        const fs = require('fs');
+        fs.appendFileSync('search_api_debug.log', `[${new Date().toISOString()}] Query: ${query}\n${responseText}\n\n`);
+      } else {
+        // If it's an error or something else, log it
+        console.log(`[DEBUG] Search API error for query "${query}":`, result);
+      }
+    } catch (e) {
+      console.error('[DEBUG] Failed to log search API response:', e);
+    }
+    // --- PATCH END ---
       if (result instanceof Error)
         throw result;
 
